@@ -127,7 +127,8 @@ class Process (object):
     def _start_locked (self):
         with self._lb_lock:
             if self._state != self.S_STOPPED:
-                logging.debug("Can't restart; process still running")
+                logging.debug("Can't restart; process still running (state=%d)" %
+                              self._state)
                 return False
             self._p = subprocess.Popen(self._args, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE)
@@ -151,7 +152,8 @@ class Process (object):
         poller = select.poll()
         poller.register(fobj, select.POLLIN | select.POLLERR | select.POLLHUP)
         process = self._p
-        while True:
+        running = True
+        while running:
             for fd, flags in poller.poll(-1):
                 if (flags & select.POLLIN):
                     line = fobj.readline()
@@ -161,7 +163,8 @@ class Process (object):
                 elif (flags & select.POLLHUP):
                     with self._lb_lock:
                         self._state |= fin_flag
-                    return
+                    running = False
+                    break
         process.wait()
         with self._lb_lock:
             # TRICKY: Will be set twice but doesn't matter as we join()

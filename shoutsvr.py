@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
+from SocketServer import ThreadingMixIn
 from datetime import datetime
 import sys
 import os
@@ -11,7 +12,6 @@ import logging
 import time
 import subprocess
 import threading
-import select
 
 __author__ = 'Manuel Huber'
 __copyright__ = "Copyright (c) 2014 Manuel Huber."
@@ -65,12 +65,15 @@ class WebRequestHandler (BaseHTTPRequestHandler):
 </pre>
 <hr>
 <a id="console_restart" href="/start">Restart task</a>
+<span id="console_status">Unknown</span>
 <script type="text/javascript">
 
 var co = {
 	install: function () {
-		co['timeout'] = 100;
+		co['timeout'] = 500;
+		co['err_timeout'] = 5000;
 		co['line'] = 0;
+		$.ajaxSetup({timeout:5000});
 		setTimeout('co.update()', co.timeout);
 	},
 	update: function () {
@@ -84,10 +87,17 @@ var co = {
 				$('#console').append(d.text);
 				co.scroll();
 			}
-			if (d.hasOwnProperty('fin') && (!d.fin)) {
-				setTimeout('co.update()', co.timeout);
+			if (d.hasOwnProperty('fin')) {
+				if (!d.fin) {
+					$('#console_status').text("Running");
+					setTimeout('co.update()', co.timeout);
+				} else {
+					$('#console_status').text("Finished");
+				}
 			}
-		}, 'json');
+		}, 'json').fail(function () {
+			setTimeout('co.update()', co.err_timeout);
+		});
 	},
         scroll: function () {
 		var c = $('#console');
@@ -131,7 +141,9 @@ class Process (object):
                               self._state)
                 return False
             self._p = subprocess.Popen(self._args, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE)
+                                       stderr=subprocess.PIPE,
+                                       stdin=subprocess.PIPE, close_fds=True)
+            self._p.stdin.close()
             self._thread_out = threading.Thread(target=self._capture,
                                                 args=(self._p.stdout, self.S_FIN_STDOUT, 'O'))
             self._thread_err = threading.Thread(target=self._capture,
@@ -145,26 +157,23 @@ class Process (object):
 
     def start (self):
         with self._start_lock:
+            with self._lb_lock:
+                if self._state != self.S_STOPPED:
+                    return False
             self._cleanup_locked()
             return self._start_locked()
 
     def _capture (self, fobj, fin_flag, id_):
-        poller = select.poll()
-        poller.register(fobj, select.POLLIN | select.POLLERR | select.POLLHUP)
         process = self._p
-        running = True
-        while running:
-            for fd, flags in poller.poll(-1):
-                if (flags & select.POLLIN):
-                    line = fobj.readline()
-                    with self._lb_lock:
-                        self._buffer.append("%s: %s" % (id_, line))
-                        self._max_line += 1
-                elif (flags & select.POLLHUP):
-                    with self._lb_lock:
-                        self._state |= fin_flag
-                    running = False
+        while True:
+            line = fobj.readline()
+            with self._lb_lock:
+                if line == '':
+                    self._state |= fin_flag
                     break
+                else:
+                    self._buffer.append("%s: %s" % (id_, line))
+                    self._max_line += 1
         process.wait()
         with self._lb_lock:
             # TRICKY: Will be set twice but doesn't matter as we join()
@@ -179,7 +188,8 @@ class Process (object):
                 obj['text'] = self._buffer[start_line:self._max_line]
             else:
                 obj['line'] = self._max_line
-            if self._state == self.S_FINISHED:
+            logging.debug("Current state: %d" % self._state)
+            if (self._state & self.S_FINISHED) == self.S_FINISHED:
                 obj['fin'] = True
             if self._p is not None:
                 ret = self._p.poll()
@@ -197,6 +207,10 @@ class Process (object):
     def cleanup (self):
         with self._start_lock:
             self._cleanup_locked()
+
+
+class ThreadedHTTPServer (ThreadingMixIn, HTTPServer):
+    pass
 
 
 class ConsoleService (object):
